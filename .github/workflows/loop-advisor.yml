@@ -1,0 +1,33 @@
+name: Loop Advisor
+
+on:
+  schedule:
+    # Every Sunday at 09:00 UTC (after Loop build at 07:33 UTC)
+    - cron: '0 9 * * 0'
+  workflow_dispatch:
+
+jobs:
+  advisor:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/loop_advisor/requirements.txt
+
+      - name: Run Loop Advisor
+        run: python scripts/loop_advisor/analyze.py
+        env:
+          NIGHTSCOUT_URL:    ${{ secrets.NIGHTSCOUT_URL }}
+          NIGHTSCOUT_SECRET: ${{ secrets.NIGHTSCOUT_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
