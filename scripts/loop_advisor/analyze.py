@@ -144,7 +144,9 @@ def summarize_loop(device_status):
     closed = sum(1 for d in records if d["loop"].get("enacted"))
     failures = sum(1 for d in records if d["loop"].get("failureReason"))
     iob_vals = [d["loop"]["iob"]["iob"] for d in records if d["loop"].get("iob")]
-    cob_vals = [d["loop"]["cob"] for d in records if d["loop"].get("cob") is not None]
+    def _cob_num(c):
+        return float(c["cob"]) if isinstance(c, dict) else float(c)
+    cob_vals = [_cob_num(d["loop"]["cob"]) for d in records if d["loop"].get("cob") is not None]
     return {
         "loop_records": len(records),
         "closed_loop_pct": round(closed / len(records) * 100, 1),
