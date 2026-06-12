@@ -43,10 +43,10 @@ def fetch_all():
 
     since_ms = int((datetime.now(timezone.utc) - timedelta(days=DAYS)).timestamp() * 1000)
     print("Fetching CGM entries...")
-    entries = ns_fetch("/api/v1/entries.json", {
-        "count": 10000,
-        "find[date][$gte]": since_ms,
-    })
+    entries = [
+        e for e in ns_fetch("/api/v1/entries.json", {"count": 10000})
+        if e.get("date", 0) >= since_ms
+    ]
 
     print("Fetching treatments...")
     treatments = ns_fetch("/api/v1/treatments.json", {
