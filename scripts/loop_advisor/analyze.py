@@ -3,9 +3,11 @@
 
 import hashlib
 import json
+import math
 import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anthropic
 import requests
@@ -40,8 +42,8 @@ def fetch_all():
     since = (datetime.now(timezone.utc) - timedelta(days=DAYS)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-
     since_ms = int((datetime.now(timezone.utc) - timedelta(days=DAYS)).timestamp() * 1000)
+
     print("Fetching CGM entries...")
     entries = [
         e for e in ns_fetch("/api/v1/entries.json", {"count": 10000})
@@ -70,26 +72,60 @@ def fetch_all():
     return entries, treatments, device_status, profile
 
 
+def get_local_tz(profile):
+    """Extract IANA timezone from Nightscout profile. Falls back to UTC."""
+    if not profile:
+        return timezone.utc, "UTC"
+    p = profile[0] if isinstance(profile, list) else profile
+    tz_name = p.get("timezone")
+    if not tz_name:
+        store = p.get("store", {})
+        key = p.get("defaultProfile", "") or next(iter(store), "")
+        tz_name = store.get(key, {}).get("timezone")
+    if tz_name:
+        try:
+            return ZoneInfo(tz_name), tz_name
+        except (ZoneInfoNotFoundError, KeyError):
+            pass
+    return timezone.utc, "UTC"
+
+
+def _parse_ts(ts_str):
+    """Parse an ISO-8601 timestamp string to a timezone-aware datetime."""
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def compute_tir(entries):
     sgvs = [e["sgv"] for e in entries if "sgv" in e and e["sgv"] > 0]
     if not sgvs:
-        return {"tir": 0, "low": 0, "high": 0, "avg": 0, "n": 0}
+        return {"tir": 0, "low": 0, "high": 0, "avg": 0, "std": 0, "cv_pct": 0, "n": 0}
     n = len(sgvs)
+    mean = sum(sgvs) / n
+    variance = sum((x - mean) ** 2 for x in sgvs) / (n - 1) if n > 1 else 0
+    std = math.sqrt(variance)
     return {
         "tir": round(sum(1 for g in sgvs if LOW <= g <= HIGH) / n * 100, 1),
         "low": round(sum(1 for g in sgvs if g < LOW) / n * 100, 1),
         "high": round(sum(1 for g in sgvs if g > HIGH) / n * 100, 1),
-        "avg": round(sum(sgvs) / n, 1),
+        "avg": round(mean, 1),
+        "std": round(std, 1),
+        "cv_pct": round(std / mean * 100, 1) if mean > 0 else 0,
         "n": n,
     }
 
 
-def tir_by_hour(entries):
+def tir_by_hour(entries, local_tz):
+    """Hour-of-day TIR breakdown in LOCAL time."""
     buckets = defaultdict(list)
     for e in entries:
         if "sgv" not in e or e["sgv"] <= 0:
             continue
-        h = datetime.fromtimestamp(e["date"] / 1000, tz=timezone.utc).hour
+        h = datetime.fromtimestamp(e["date"] / 1000, tz=local_tz).hour
         buckets[h].append(e["sgv"])
     out = {}
     for h in range(24):
@@ -106,76 +142,92 @@ def tir_by_hour(entries):
     return out
 
 
-def summarize_treatments(treatments):
-    # Catch all insulin-delivering treatments regardless of eventType label
-    boluses = [t for t in treatments if float(t.get("insulin") or 0) > 0]
+def summarize_treatments(treatments, local_tz):
+    manual_bolus_types = {"Bolus", "Meal Bolus", "Snack Bolus", "Correction Bolus"}
+    manual_boluses = [
+        t for t in treatments
+        if t.get("eventType") in manual_bolus_types and float(t.get("insulin") or 0) > 0
+    ]
+    carb_events = [t for t in treatments if float(t.get("carbs") or 0) > 0]
+    temp_basals = [t for t in treatments if t.get("eventType") == "Temp Basal"]
 
-    # Log the event types actually seen for debugging
     event_types = {}
     for t in treatments:
         et = t.get("eventType", "<none>")
         event_types[et] = event_types.get(et, 0) + 1
     print(f"  Treatment event types: {event_types}")
 
-    manual_bolus_types = {"Bolus", "Meal Bolus", "Snack Bolus", "Correction Bolus"}
-    manual_boluses = [t for t in boluses if t.get("eventType") in manual_bolus_types]
-    auto_boluses = [t for t in boluses if t.get("eventType") not in manual_bolus_types]
+    bolus_by_hour = defaultdict(float)
+    for b in manual_boluses:
+        dt = _parse_ts(b.get("created_at") or b.get("timestamp", ""))
+        if dt:
+            bolus_by_hour[dt.astimezone(local_tz).hour] += float(b.get("insulin", 0))
 
-    carb_events = [t for t in treatments if float(t.get("carbs") or 0) > 0]
-    temp_basals = [t for t in treatments if t.get("eventType") == "Temp Basal"]
+    total_manual_insulin = sum(float(b.get("insulin", 0)) for b in manual_boluses)
     return {
-        "bolus_count": len(boluses),
         "manual_bolus_count": len(manual_boluses),
-        "auto_bolus_count": len(auto_boluses),
-        "avg_bolus_units": (
-            round(sum(float(b.get("insulin", 0)) for b in boluses) / len(boluses), 2)
-            if boluses else 0
+        "avg_manual_bolus_units": (
+            round(total_manual_insulin / len(manual_boluses), 2) if manual_boluses else 0
         ),
-        "total_daily_bolus_avg": round(
-            sum(float(b.get("insulin", 0)) for b in boluses) / DAYS, 2
-        ),
+        "avg_daily_manual_bolus_units": round(total_manual_insulin / DAYS, 2),
         "carb_events_count": len(carb_events),
-        "avg_carbs_per_meal": (
+        "avg_carbs_per_event": (
             round(
-                sum(float(c.get("carbs", 0)) for c in carb_events) / len(carb_events),
-                1,
+                sum(float(c.get("carbs", 0)) for c in carb_events) / len(carb_events), 1
             )
             if carb_events else 0
         ),
         "temp_basal_count": len(temp_basals),
+        "manual_bolus_insulin_by_local_hour": {
+            str(h): round(v, 2) for h, v in sorted(bolus_by_hour.items())
+        },
     }
 
 
-def summarize_loop(device_status):
+def summarize_loop(device_status, local_tz):
     records = [d for d in device_status if "loop" in d]
     if not records:
         return {"loop_records": 0}
 
     failures = sum(1 for d in records if d["loop"].get("failureReason"))
-
-    # enacted_pct = % of cycles where Loop actively changed delivery.
-    # Cycles where Loop ran but kept current delivery are NOT counted.
-    # This is NOT a closed-loop uptime metric — it just measures intervention rate.
     has_enacted = sum(1 for d in records if d["loop"].get("enacted"))
 
-    # Auto-boluses: stored in enacted.bolusVolume, not in treatments
     auto_bolus_records = [
         d for d in records
-        if d["loop"].get("enacted", {}).get("bolusVolume", 0) > 0
+        if isinstance(d["loop"].get("enacted"), dict)
+        and float(d["loop"]["enacted"].get("bolusVolume") or 0) > 0
     ]
     auto_bolus_total = sum(
-        float(d["loop"]["enacted"].get("bolusVolume", 0))
-        for d in auto_bolus_records
+        float(d["loop"]["enacted"].get("bolusVolume", 0)) for d in auto_bolus_records
     )
 
-    iob_vals = [d["loop"]["iob"]["iob"] for d in records if d["loop"].get("iob")]
+    auto_bolus_by_hour = defaultdict(float)
+    for d in auto_bolus_records:
+        dt = _parse_ts(d.get("created_at") or d.get("dateString", ""))
+        if dt:
+            auto_bolus_by_hour[dt.astimezone(local_tz).hour] += float(
+                d["loop"]["enacted"].get("bolusVolume", 0)
+            )
+
+    iob_vals = [
+        d["loop"]["iob"]["iob"]
+        for d in records
+        if isinstance(d["loop"].get("iob"), dict) and "iob" in d["loop"]["iob"]
+    ]
+
     def _cob_num(c):
         return float(c["cob"]) if isinstance(c, dict) else float(c)
-    cob_vals = [_cob_num(d["loop"]["cob"]) for d in records if d["loop"].get("cob") is not None]
+
+    cob_vals = [
+        _cob_num(d["loop"]["cob"])
+        for d in records
+        if d["loop"].get("cob") is not None
+    ]
 
     print(
-        f"  Loop uptime debug: records={len(records)}, enacted={has_enacted}, "
-        f"failures={failures}, auto_bolus_events={len(auto_bolus_records)}"
+        f"  Loop debug: records={len(records)}, enacted={has_enacted}, "
+        f"failures={failures}, auto_bolus_events={len(auto_bolus_records)}, "
+        f"auto_bolus_total={round(auto_bolus_total, 1)}U"
     )
 
     return {
@@ -184,55 +236,89 @@ def summarize_loop(device_status):
         "failure_pct": round(failures / len(records) * 100, 1),
         "auto_bolus_events": len(auto_bolus_records),
         "auto_bolus_total_units": round(auto_bolus_total, 2),
+        "avg_daily_auto_bolus_units": round(auto_bolus_total / DAYS, 2),
+        "auto_bolus_insulin_by_local_hour": {
+            str(h): round(v, 2) for h, v in sorted(auto_bolus_by_hour.items())
+        },
         "avg_iob": round(sum(iob_vals) / len(iob_vals), 2) if iob_vals else 0,
         "avg_cob": round(sum(cob_vals) / len(cob_vals), 1) if cob_vals else 0,
     }
 
 
 def summarize_profile(profile):
-    if not profile:        return {}
+    if not profile:
+        return {}
     p = profile[0] if isinstance(profile, list) else profile
     store = p.get("store", {})
     default = store.get(
         p.get("defaultProfile", ""), store.get(next(iter(store), ""), {})
     )
 
-    def avg(schedule):
+    def fmt_schedule(schedule):
+        """Return time→value dict. Times are LOCAL (Nightscout stores in local time)."""
         if not schedule:
             return None
-        return round(
-            sum(float(s.get("value", 0)) for s in schedule) / len(schedule), 2
-        )
+        return {
+            f"{int(s['timeAsSeconds'] // 3600):02d}:{int((s['timeAsSeconds'] % 3600) // 60):02d}":
+            round(float(s.get("value", 0)), 3)
+            for s in sorted(schedule, key=lambda x: x["timeAsSeconds"])
+        }
 
+    def wavg(schedule):
+        """Time-weighted average across schedule blocks."""
+        if not schedule:
+            return None
+        sched = sorted(schedule, key=lambda x: x["timeAsSeconds"])
+        total_weight = 0.0
+        total_val = 0.0
+        for i, s in enumerate(sched):
+            start = s["timeAsSeconds"]
+            end = sched[i + 1]["timeAsSeconds"] if i + 1 < len(sched) else 86400
+            weight = end - start
+            total_val += float(s.get("value", 0)) * weight
+            total_weight += weight
+        return round(total_val / total_weight, 2) if total_weight else None
+
+    tz_name = default.get("timezone") or p.get("timezone", "UTC")
     return {
-        "avg_basal_u_hr": avg(default.get("basal")),
-        "avg_isf_mg_dl_per_u": avg(default.get("sens")),
-        "avg_icr_g_per_u": avg(default.get("carbratio")),
-        "target_low": (default.get("target_low") or [{}])[0].get("value"),
-        "target_high": (default.get("target_high") or [{}])[0].get("value"),
+        "timezone": tz_name,
+        "basal_schedule_u_hr": fmt_schedule(default.get("basal")),
+        "isf_schedule_mg_dl_per_u": fmt_schedule(default.get("sens")),
+        "icr_schedule_g_per_u": fmt_schedule(default.get("carbratio")),
+        "target_low_schedule": fmt_schedule(default.get("target_low")),
+        "target_high_schedule": fmt_schedule(default.get("target_high")),
+        "weighted_avg_basal_u_hr": wavg(default.get("basal")),
+        "weighted_avg_isf_mg_dl_per_u": wavg(default.get("sens")),
+        "weighted_avg_icr_g_per_u": wavg(default.get("carbratio")),
     }
 
 
 SYSTEM_PROMPT = """\
 You are a diabetes technology specialist analyzing Loop closed-loop insulin delivery data.
 
-Produce a practical weekly report for the patient/caregiver from 30 days of Loop data.
+Produce a thorough monthly report for the patient/caregiver from 30 days of Loop data.
+
+Data notes:
+- All hours are in the patient's LOCAL timezone (from their Nightscout profile).
+- "intervention_rate_pct" = % of Loop cycles where delivery was actively changed. This is NOT a closed-loop uptime metric — cycles where Loop ran and kept current delivery unchanged are excluded.
+- Auto-boluses are Loop's automatic insulin deliveries (from loop_performance). Manual boluses are corrections the patient entered manually (from treatment_summary).
+- "cv_pct" = coefficient of variation (std/mean × 100). Target <36% indicates stable glucose control.
+- Profile schedules show the actual time-block settings in local time. Use these for specific recommendations.
 
 Rules:
-- Be specific and quantitative — cite the actual numbers from the data.
+- Be specific and quantitative — cite actual numbers.
+- For every setting change recommendation state: which schedule block to change, current value, suggested new value, and rationale from the data.
 - Distinguish settings changes from behavioral adjustments.
-- For any setting change recommendation, include direction and magnitude (e.g. "increase ISF from ~X to ~Y mg/dL per unit during 6am–10am").
-- Flag safety concerns prominently.
-- Stay focused on what the Loop data reveals; skip generic diabetes advice.
+- Flag safety concerns prominently (especially recurring lows).
+- Skip generic diabetes advice; focus on what the Loop data shows.
 - Format output as GitHub-flavored Markdown.
 
 Use these exact section headers:
 ## Summary
-## Time in Range
+## Time in Range & Variability
 ## Overnight Performance (10pm–6am)
-## Post-Meal Performance
-## Loop System Performance
-Note on loop_performance data: "intervention_rate_pct" = % of cycles where Loop actively changed delivery. Cycles where Loop ran but kept current delivery are NOT counted. This is NOT an open/closed loop uptime metric.
+## Daytime & Post-Meal Performance
+## Insulin Delivery Analysis
 ## Setting Change Recommendations
 ## Customization Opportunities
 (Customization Opportunities = findings requiring a Loop fork code change, not just settings. Write "None identified this week." if nothing qualifies.)"""
@@ -242,7 +328,7 @@ def run_analysis(payload):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     msg = client.messages.create(
         model="claude-opus-4-7",
-        max_tokens=4096,
+        max_tokens=8192,
         system=[{
             "type": "text",
             "text": SYSTEM_PROMPT,
@@ -251,7 +337,7 @@ def run_analysis(payload):
         messages=[{
             "role": "user",
             "content": (
-                "Analyze this Loop data and produce the weekly report:\n\n"
+                "Analyze this Loop data and produce the monthly report:\n\n"
                 f"```json\n{json.dumps(payload, indent=2)}\n```"
             ),
         }],
@@ -308,23 +394,26 @@ def post_issue(title, body):
 
 def main():
     entries, treatments, device_status, profile = fetch_all()
+    local_tz, tz_name = get_local_tz(profile)
+    print(f"  Timezone: {tz_name}")
 
     payload = {
         "period_days": DAYS,
         "analysis_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "local_timezone": tz_name,
         "overall_tir": compute_tir(entries),
-        "tir_by_hour": tir_by_hour(entries),
-        "treatment_summary": summarize_treatments(treatments),
-        "loop_performance": summarize_loop(device_status),
+        "tir_by_local_hour": tir_by_hour(entries, local_tz),
+        "treatment_summary": summarize_treatments(treatments, local_tz),
+        "loop_performance": summarize_loop(device_status, local_tz),
         "current_settings": summarize_profile(profile),
     }
-    print(f"Overall TIR: {payload['overall_tir']['tir']}%")
+    print(f"Overall TIR: {payload['overall_tir']['tir']}%, CV: {payload['overall_tir']['cv_pct']}%")
 
     print("Running Claude analysis...")
     report = run_analysis(payload)
 
     week = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    post_issue(f"Loop Advisor — Weekly Report ({week})", report)
+    post_issue(f"Loop Advisor — Monthly Report ({week})", report)
 
 
 if __name__ == "__main__":
