@@ -150,16 +150,47 @@ def summarize_loop(device_status):
     records = [d for d in device_status if "loop" in d]
     if not records:
         return {"loop_records": 0}
-    closed = sum(1 for d in records if d["loop"].get("enacted"))
+
     failures = sum(1 for d in records if d["loop"].get("failureReason"))
+
+    # "Closed loop" = Loop made a recommendation (auto or manual mode active).
+    # Records with neither enacted nor recommended indicate open-loop/no-data cycles.
+    has_enacted = sum(1 for d in records if d["loop"].get("enacted"))
+    has_recommended = sum(1 for d in records if d["loop"].get("recommended"))
+    # A cycle is active if Loop produced any recommendation, enacted or not
+    active = sum(
+        1 for d in records
+        if d["loop"].get("enacted") or d["loop"].get("recommended")
+    )
+
+    # Auto-boluses: stored in enacted.bolusVolume, not in treatments
+    auto_bolus_records = [
+        d for d in records
+        if d["loop"].get("enacted", {}).get("bolusVolume", 0) > 0
+    ]
+    auto_bolus_total = sum(
+        float(d["loop"]["enacted"].get("bolusVolume", 0))
+        for d in auto_bolus_records
+    )
+
     iob_vals = [d["loop"]["iob"]["iob"] for d in records if d["loop"].get("iob")]
     def _cob_num(c):
         return float(c["cob"]) if isinstance(c, dict) else float(c)
     cob_vals = [_cob_num(d["loop"]["cob"]) for d in records if d["loop"].get("cob") is not None]
+
+    print(
+        f"  Loop uptime debug: records={len(records)}, enacted={has_enacted}, "
+        f"recommended={has_recommended}, active={active}, failures={failures}, "
+        f"auto_bolus_events={len(auto_bolus_records)}"
+    )
+
     return {
         "loop_records": len(records),
-        "closed_loop_pct": round(closed / len(records) * 100, 1),
+        "closed_loop_pct": round(active / len(records) * 100, 1),
+        "enacted_pct": round(has_enacted / len(records) * 100, 1),
         "failure_pct": round(failures / len(records) * 100, 1),
+        "auto_bolus_events": len(auto_bolus_records),
+        "auto_bolus_total_units": round(auto_bolus_total, 2),
         "avg_iob": round(sum(iob_vals) / len(iob_vals), 2) if iob_vals else 0,
         "avg_cob": round(sum(cob_vals) / len(cob_vals), 1) if cob_vals else 0,
     }
