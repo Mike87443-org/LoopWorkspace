@@ -76,7 +76,15 @@ def fetch_all():
 
 
 def get_local_tz(profile):
-    """Extract IANA timezone from Nightscout profile. Falls back to UTC."""
+    """Extract IANA timezone: env var → Nightscout profile → UTC."""
+    # Explicit override wins (set NIGHTSCOUT_TZ in workflow env)
+    env_tz = os.environ.get("NIGHTSCOUT_TZ", "").strip()
+    if env_tz:
+        try:
+            return ZoneInfo(env_tz), env_tz
+        except (ZoneInfoNotFoundError, KeyError):
+            pass
+
     if not profile:
         return timezone.utc, "UTC"
     p = profile[0] if isinstance(profile, list) else profile
