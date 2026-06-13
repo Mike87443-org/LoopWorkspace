@@ -51,10 +51,13 @@ def fetch_all():
     ]
 
     print("Fetching treatments...")
-    treatments = ns_fetch("/api/v1/treatments.json", {
-        "count": 5000,
-        "find[created_at][$gte]": since,
-    })
+    # Fetch without server-side date filter (same issue as CGM entries — server
+    # drops records when find[created_at] is used). Filter in Python instead.
+    all_treatments = ns_fetch("/api/v1/treatments.json", {"count": 5000})
+    treatments = [
+        t for t in all_treatments
+        if (t.get("created_at") or "") >= since or (t.get("timestamp") or "") >= since
+    ]
 
     print("Fetching device status...")
     device_status = ns_fetch("/api/v1/devicestatus.json", {
@@ -156,6 +159,7 @@ def summarize_treatments(treatments, local_tz):
         et = t.get("eventType", "<none>")
         event_types[et] = event_types.get(et, 0) + 1
     print(f"  Treatment event types: {event_types}")
+    print(f"  Carb events: {len(carb_events)}, Manual boluses: {len(manual_boluses)}")
 
     bolus_by_hour = defaultdict(float)
     for b in manual_boluses:
