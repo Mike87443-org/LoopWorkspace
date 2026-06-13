@@ -153,15 +153,10 @@ def summarize_loop(device_status):
 
     failures = sum(1 for d in records if d["loop"].get("failureReason"))
 
-    # "Closed loop" = Loop made a recommendation (auto or manual mode active).
-    # Records with neither enacted nor recommended indicate open-loop/no-data cycles.
+    # enacted_pct = % of cycles where Loop actively changed something.
+    # Cycles where Loop ran but kept current delivery unchanged do NOT set enacted,
+    # so this is NOT a closed-loop uptime metric — it just measures intervention rate.
     has_enacted = sum(1 for d in records if d["loop"].get("enacted"))
-    has_recommended = sum(1 for d in records if d["loop"].get("recommended"))
-    # A cycle is active if Loop produced any recommendation, enacted or not
-    active = sum(
-        1 for d in records
-        if d["loop"].get("enacted") or d["loop"].get("recommended")
-    )
 
     # Auto-boluses: stored in enacted.bolusVolume, not in treatments
     auto_bolus_records = [
@@ -180,14 +175,12 @@ def summarize_loop(device_status):
 
     print(
         f"  Loop uptime debug: records={len(records)}, enacted={has_enacted}, "
-        f"recommended={has_recommended}, active={active}, failures={failures}, "
-        f"auto_bolus_events={len(auto_bolus_records)}"
+        f"failures={failures}, auto_bolus_events={len(auto_bolus_records)}"
     )
 
     return {
         "loop_records": len(records),
-        "closed_loop_pct": round(active / len(records) * 100, 1),
-        "enacted_pct": round(has_enacted / len(records) * 100, 1),
+        "intervention_rate_pct": round(has_enacted / len(records) * 100, 1),
         "failure_pct": round(failures / len(records) * 100, 1),
         "auto_bolus_events": len(auto_bolus_records),
         "auto_bolus_total_units": round(auto_bolus_total, 2),
@@ -240,6 +233,7 @@ Use these exact section headers:
 ## Overnight Performance (10pm–6am)
 ## Post-Meal Performance
 ## Loop System Performance
+Note on loop_performance data: "intervention_rate_pct" = % of cycles where Loop actively changed delivery. Cycles where Loop ran but kept current delivery are NOT counted. This is NOT an open/closed loop uptime metric.
 ## Setting Change Recommendations
 ## Customization Opportunities
 (Customization Opportunities = findings requiring a Loop fork code change, not just settings. Write "None identified this week." if nothing qualifies.)"""
