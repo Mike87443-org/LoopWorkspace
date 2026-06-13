@@ -107,15 +107,26 @@ def tir_by_hour(entries):
 
 
 def summarize_treatments(treatments):
-    boluses = [
-        t for t in treatments
-        if t.get("eventType") in ("Bolus", "Meal Bolus", "Snack Bolus")
-        and t.get("insulin")
-    ]
+    # Catch all insulin-delivering treatments regardless of eventType label
+    boluses = [t for t in treatments if float(t.get("insulin") or 0) > 0]
+
+    # Log the event types actually seen for debugging
+    event_types = {}
+    for t in treatments:
+        et = t.get("eventType", "<none>")
+        event_types[et] = event_types.get(et, 0) + 1
+    print(f"  Treatment event types: {event_types}")
+
+    manual_bolus_types = {"Bolus", "Meal Bolus", "Snack Bolus", "Correction Bolus"}
+    manual_boluses = [t for t in boluses if t.get("eventType") in manual_bolus_types]
+    auto_boluses = [t for t in boluses if t.get("eventType") not in manual_bolus_types]
+
     carb_events = [t for t in treatments if float(t.get("carbs") or 0) > 0]
     temp_basals = [t for t in treatments if t.get("eventType") == "Temp Basal"]
     return {
         "bolus_count": len(boluses),
+        "manual_bolus_count": len(manual_boluses),
+        "auto_bolus_count": len(auto_boluses),
         "avg_bolus_units": (
             round(sum(float(b.get("insulin", 0)) for b in boluses) / len(boluses), 2)
             if boluses else 0
