@@ -18,7 +18,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPOSITORY = os.environ["GITHUB_REPOSITORY"]
 
-DAYS = 30
+DAYS = 30  # maximum lookback window to fetch
 LOW = 70
 HIGH = 180
 
@@ -153,7 +153,7 @@ def tir_by_hour(entries, local_tz):
     return out
 
 
-def summarize_treatments(treatments, local_tz):
+def summarize_treatments(treatments, local_tz, actual_days):
     manual_bolus_types = {"Bolus", "Meal Bolus", "Snack Bolus", "Correction Bolus"}
     manual_boluses = [
         t for t in treatments
@@ -167,8 +167,8 @@ def summarize_treatments(treatments, local_tz):
         et = t.get("eventType", "<none>")
         event_types[et] = event_types.get(et, 0) + 1
     print(f"  Treatment event types: {event_types}")
-    print(f"  Carb events: {len(carb_events)}, Manual boluses: {len(manual_boluses)}")
 
+    # Manual bolus units by local hour (to correlate with meal times)
     bolus_by_hour = defaultdict(float)
     for b in manual_boluses:
         dt = _parse_ts(b.get("created_at") or b.get("timestamp", ""))
@@ -181,7 +181,7 @@ def summarize_treatments(treatments, local_tz):
         "avg_manual_bolus_units": (
             round(total_manual_insulin / len(manual_boluses), 2) if manual_boluses else 0
         ),
-        "avg_daily_manual_bolus_units": round(total_manual_insulin / DAYS, 2),
+        "avg_daily_manual_bolus_units": round(total_manual_insulin / actual_days, 2),
         "carb_events_count": len(carb_events),
         "avg_carbs_per_event": (
             round(
@@ -196,7 +196,7 @@ def summarize_treatments(treatments, local_tz):
     }
 
 
-def summarize_loop(device_status, local_tz):
+def summarize_loop(device_status, local_tz, actual_days):
     records = [d for d in device_status if "loop" in d]
     if not records:
         return {"loop_records": 0}
@@ -204,6 +204,8 @@ def summarize_loop(device_status, local_tz):
     failures = sum(1 for d in records if d["loop"].get("failureReason"))
     has_enacted = sum(1 for d in records if d["loop"].get("enacted"))
 
+    # Auto-boluses are in enacted.bolusVolume (not in treatments).
+    # Guard: enacted is sometimes a bool rather than a dict.
     auto_bolus_records = [
         d for d in records
         if isinstance(d["loop"].get("enacted"), dict)
@@ -213,6 +215,7 @@ def summarize_loop(device_status, local_tz):
         float(d["loop"]["enacted"].get("bolusVolume", 0)) for d in auto_bolus_records
     )
 
+    # Auto-bolus distribution by local hour
     auto_bolus_by_hour = defaultdict(float)
     for d in auto_bolus_records:
         dt = _parse_ts(d.get("created_at") or d.get("dateString", ""))
@@ -221,6 +224,7 @@ def summarize_loop(device_status, local_tz):
                 d["loop"]["enacted"].get("bolusVolume", 0)
             )
 
+    # Safe IOB/COB extraction
     iob_vals = [
         d["loop"]["iob"]["iob"]
         for d in records
@@ -248,7 +252,7 @@ def summarize_loop(device_status, local_tz):
         "failure_pct": round(failures / len(records) * 100, 1),
         "auto_bolus_events": len(auto_bolus_records),
         "auto_bolus_total_units": round(auto_bolus_total, 2),
-        "avg_daily_auto_bolus_units": round(auto_bolus_total / DAYS, 2),
+        "avg_daily_auto_bolus_units": round(auto_bolus_total / actual_days, 2),
         "auto_bolus_insulin_by_local_hour": {
             str(h): round(v, 2) for h, v in sorted(auto_bolus_by_hour.items())
         },
@@ -308,9 +312,11 @@ def summarize_profile(profile):
 SYSTEM_PROMPT = """\
 You are a diabetes technology specialist analyzing Loop closed-loop insulin delivery data.
 
-Produce a thorough monthly report for the patient/caregiver from 30 days of Loop data.
+Produce a thorough report for the patient/caregiver from their Loop data.
 
 Data notes:
+- "period_days" is the ACTUAL number of days of Nightscout data available — use this in your report title and throughout. Do NOT assume 30 days.
+- If period_days < 14, add a prominent caveat that hourly patterns and trend conclusions are based on limited data and may not yet be statistically reliable.
 - All hours are in the patient's LOCAL timezone (from their Nightscout profile).
 - "intervention_rate_pct" = % of Loop cycles where delivery was actively changed. This is NOT a closed-loop uptime metric — cycles where Loop ran and kept current delivery unchanged are excluded.
 - Auto-boluses are Loop's automatic insulin deliveries (from loop_performance). Manual boluses are corrections the patient entered manually (from treatment_summary).
@@ -333,7 +339,7 @@ Use these exact section headers:
 ## Insulin Delivery Analysis
 ## Setting Change Recommendations
 ## Customization Opportunities
-(Customization Opportunities = findings requiring a Loop fork code change, not just settings. Write "None identified this week." if nothing qualifies.)"""
+(Customization Opportunities = findings requiring a Loop fork code change, not just settings. Write "None identified this month." if nothing qualifies.)"""
 
 
 def run_analysis(payload):
@@ -409,14 +415,24 @@ def main():
     local_tz, tz_name = get_local_tz(profile)
     print(f"  Timezone: {tz_name}")
 
+    # Detect actual data span from earliest CGM reading
+    now_utc = datetime.now(timezone.utc)
+    if entries:
+        earliest_ms = min(e["date"] for e in entries if "date" in e)
+        earliest_dt = datetime.fromtimestamp(earliest_ms / 1000, tz=timezone.utc)
+        actual_days = max(1, min(DAYS, round((now_utc - earliest_dt).total_seconds() / 86400)))
+    else:
+        actual_days = DAYS
+    print(f"  Data span: {actual_days} days (requested {DAYS})")
+
     payload = {
-        "period_days": DAYS,
-        "analysis_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "period_days": actual_days,
+        "analysis_date": now_utc.strftime("%Y-%m-%d"),
         "local_timezone": tz_name,
         "overall_tir": compute_tir(entries),
         "tir_by_local_hour": tir_by_hour(entries, local_tz),
-        "treatment_summary": summarize_treatments(treatments, local_tz),
-        "loop_performance": summarize_loop(device_status, local_tz),
+        "treatment_summary": summarize_treatments(treatments, local_tz, actual_days),
+        "loop_performance": summarize_loop(device_status, local_tz, actual_days),
         "current_settings": summarize_profile(profile),
     }
     print(f"Overall TIR: {payload['overall_tir']['tir']}%, CV: {payload['overall_tir']['cv_pct']}%")
@@ -424,8 +440,13 @@ def main():
     print("Running Claude analysis...")
     report = run_analysis(payload)
 
-    week = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    post_issue(f"Loop Advisor — Monthly Report ({week})", report)
+    if actual_days >= 25:
+        period_label = "Monthly"
+    else:
+        period_label = f"{actual_days}-Day"
+
+    date_str = now_utc.strftime("%Y-%m-%d")
+    post_issue(f"Loop Advisor — {period_label} Report ({date_str})", report)
 
 
 if __name__ == "__main__":
