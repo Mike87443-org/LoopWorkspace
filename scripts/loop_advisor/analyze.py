@@ -168,14 +168,20 @@ def summarize_treatments(treatments, local_tz, actual_days):
         event_types[et] = event_types.get(et, 0) + 1
     print(f"  Treatment event types: {event_types}")
 
-    # Manual bolus units by local hour (to correlate with meal times)
+    # Manual bolus units and carb grams by local hour
     bolus_by_hour = defaultdict(float)
+    carbs_by_hour = defaultdict(float)
     for b in manual_boluses:
         dt = _parse_ts(b.get("created_at") or b.get("timestamp", ""))
         if dt:
             bolus_by_hour[dt.astimezone(local_tz).hour] += float(b.get("insulin", 0))
+    for c in carb_events:
+        dt = _parse_ts(c.get("created_at") or c.get("timestamp", ""))
+        if dt:
+            carbs_by_hour[dt.astimezone(local_tz).hour] += float(c.get("carbs", 0))
 
     total_manual_insulin = sum(float(b.get("insulin", 0)) for b in manual_boluses)
+    total_carbs = sum(float(c.get("carbs", 0)) for c in carb_events)
     return {
         "manual_bolus_count": len(manual_boluses),
         "avg_manual_bolus_units": (
@@ -183,15 +189,16 @@ def summarize_treatments(treatments, local_tz, actual_days):
         ),
         "avg_daily_manual_bolus_units": round(total_manual_insulin / actual_days, 2),
         "carb_events_count": len(carb_events),
+        "total_carbs_g": round(total_carbs, 1),
         "avg_carbs_per_event": (
-            round(
-                sum(float(c.get("carbs", 0)) for c in carb_events) / len(carb_events), 1
-            )
-            if carb_events else 0
+            round(total_carbs / len(carb_events), 1) if carb_events else 0
         ),
         "temp_basal_count": len(temp_basals),
         "manual_bolus_insulin_by_local_hour": {
             str(h): round(v, 2) for h, v in sorted(bolus_by_hour.items())
+        },
+        "carb_grams_by_local_hour": {
+            str(h): round(v, 1) for h, v in sorted(carbs_by_hour.items())
         },
     }
 
@@ -320,6 +327,7 @@ Data notes:
 - All hours are in the patient's LOCAL timezone (from their Nightscout profile).
 - "intervention_rate_pct" = % of Loop cycles where delivery was actively changed. This is NOT a closed-loop uptime metric — cycles where Loop ran and kept current delivery unchanged are excluded.
 - Auto-boluses are Loop's automatic insulin deliveries (from loop_performance). Manual boluses are corrections the patient entered manually (from treatment_summary).
+- "carb_grams_by_local_hour" shows total carbohydrates logged per hour. Cross-reference this directly against "manual_bolus_insulin_by_local_hour" to identify meal windows — do NOT ask whether a bolus was a meal; look at whether carbs were logged in the same hour.
 - "cv_pct" = coefficient of variation (std/mean × 100). Target <36% indicates stable glucose control.
 - Profile schedules show the actual time-block settings in local time. Use these for specific recommendations.
 
