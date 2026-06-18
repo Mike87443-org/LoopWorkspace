@@ -325,19 +325,25 @@ Data notes:
 - "carb_grams_by_local_hour" shows total carbohydrates logged per hour. Cross-reference this directly against "manual_bolus_insulin_by_local_hour" to identify meal windows — do NOT ask whether a bolus was a meal; look at whether carbs were logged in the same hour.
 - "cv_pct" = coefficient of variation (std/mean × 100). Target <36% indicates stable glucose control.
 - Profile schedules show the actual time-block settings in local time. Use these for specific recommendations.
+- "tir_by_local_hour" includes "n" = number of CGM readings in that hour bucket. With 5-min CGM, 1 night = ~12 readings/hour. When n < 24 (fewer than 2 nights of data), the low_pct for that hour is statistically unreliable — a single low event can inflate it dramatically. Always note the sample count (e.g. "32% lows at 2 AM, n=14 — only 1 night of data") and qualify any hour with n < 24 as insufficient to draw conclusions from.
+
+Time format rules — STRICTLY ENFORCED throughout the entire report:
+- ALWAYS use 12-hour AM/PM format for clock times in all narrative, tables, section headers, and recommendations. Examples: "2 AM", "6 PM", "10:30 PM", "7 AM–9 AM".
+- NEVER write 24-hour time (e.g. never write 02:00, 18:00, 22:00, 14:00).
+- Profile schedule keys (from current_settings) are stored as "HH:MM" internally — when citing them in your output, convert to AM/PM (e.g. "00:00" → "12 AM", "14:00" → "2 PM").
 
 Rules:
 - Be specific and quantitative — cite actual numbers.
 - For every setting change recommendation state: which schedule block to change, current value, suggested new value, and rationale from the data.
 - Distinguish settings changes from behavioral adjustments.
-- Flag safety concerns prominently (especially recurring lows).
+- Flag safety concerns prominently (especially recurring lows), but always note sample size when n is small.
 - Skip generic diabetes advice; focus on what the Loop data shows.
 - Format output as GitHub-flavored Markdown.
 
 Use these exact section headers:
 ## Summary
 ## Time in Range & Variability
-## Overnight Performance (10pm–6am)
+## Overnight Performance (10 PM–6 AM)
 ## Daytime & Post-Meal Performance
 ## Insulin Delivery Analysis
 ## Setting Change Recommendations
