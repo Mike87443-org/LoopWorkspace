@@ -518,11 +518,9 @@ def run_analysis(payload):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     msg = client.messages.create(
         model="claude-opus-4-7",
-        max_tokens=20000,   # thinking (up to 10k) + report (up to 10k)
-        thinking={
-            "type": "enabled",
-            "budget_tokens": 10000,
-        },
+        max_tokens=20000,
+        thinking={"type": "adaptive"},
+        output_config={"effort": "high"},
         system=[{
             "type": "text",
             "text": SYSTEM_PROMPT,
